@@ -214,28 +214,46 @@ SSL* SSLContext::createSSL() {
 // TSSLSocket implementation
 TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx)
   : TSocket(), server_(false), ssl_(NULL), ctx_(ctx) {
+  isHandshakeCompleted_ = false;
+  readretries_ = 0;
+  eventSafe_ = false;
 }
 
 TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, boost::shared_ptr<THRIFT_SOCKET> interruptListener)
         : TSocket(), server_(false), ssl_(NULL), ctx_(ctx) {
   interruptListener_ = interruptListener;
+  isHandshakeCompleted_ = false;
+  readretries_ = 0;
+  eventSafe_ = false;
 }
 
 TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, THRIFT_SOCKET socket)
   : TSocket(socket), server_(false), ssl_(NULL), ctx_(ctx) {
+  isHandshakeCompleted_ = false;
+  readretries_ = 0;
+  eventSafe_ = false;
 }
 
 TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, THRIFT_SOCKET socket, boost::shared_ptr<THRIFT_SOCKET> interruptListener)
         : TSocket(socket, interruptListener), server_(false), ssl_(NULL), ctx_(ctx) {
+  isHandshakeCompleted_ = false;
+  readretries_ = 0;
+  eventSafe_ = false;
 }
 
 TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, string host, int port)
   : TSocket(host, port), server_(false), ssl_(NULL), ctx_(ctx) {
+  isHandshakeCompleted_ = false;
+  readretries_ = 0;
+  eventSafe_ = false;
 }
 
 TSSLSocket::TSSLSocket(boost::shared_ptr<SSLContext> ctx, string host, int port, boost::shared_ptr<THRIFT_SOCKET> interruptListener)
         : TSocket(host, port), server_(false), ssl_(NULL), ctx_(ctx) {
   interruptListener_ = interruptListener;
+  isHandshakeCompleted_ = false;
+  readretries_ = 0;
+  eventSafe_ = false;
 }
 
 TSSLSocket::~TSSLSocket() {
@@ -256,11 +274,16 @@ bool TSSLSocket::isOpen() {
   return true;
 }
 
+/*
+ * Note: This method is not libevent safe.
+*/
 bool TSSLSocket::peek() {
   if (!isOpen()) {
     return false;
   }
-  checkHandshake();
+  initializeHandshake();
+  if (!checkHandshake())
+    throw TSSLException("SSL_peek: Handshake is not completed");
   int rc;
   uint8_t byte;
   do {
@@ -299,6 +322,9 @@ void TSSLSocket::open() {
   TSocket::open();
 }
 
+/*
+ * Note: This method is not libevent safe.
+*/
 void TSSLSocket::close() {
   if (ssl_ != NULL) {
     try {
@@ -339,37 +365,63 @@ void TSSLSocket::close() {
     }
     SSL_free(ssl_);
     ssl_ = NULL;
+    isHandshakeCompleted_ = false;
     ERR_remove_state(0);
   }
   TSocket::close();
 }
 
+/*
+ * Returns number of bytes read in SSL Socket.
+ * If eventSafe is set, and it may returns 0 bytes then read method
+ * needs to be called again until it is successfull or it throws
+ * exception incase of failure.
+*/
 uint32_t TSSLSocket::read(uint8_t* buf, uint32_t len) {
-  checkHandshake();
+  initializeHandshake();
+  if (!checkHandshake())
+    return 0;
+  int shutdown = SSL_get_shutdown(ssl_);
+  // "!!" is squelching C4800 "forcing bool -> true or false" performance warning
+  bool shutdownReceived = !!(shutdown & SSL_RECEIVED_SHUTDOWN);
+  if (shutdownReceived) {
+    throw TTransportException(TTransportException::NOT_OPEN);
+  }
   int32_t bytes = 0;
-  for (int32_t retries = 0; retries < maxRecvRetries_; retries++) {
+  while (readretries_ < maxRecvRetries_) {
     ERR_clear_error();
     bytes = SSL_read(ssl_, buf, len);
-    if (bytes >= 0)
-      break;
-    int32_t errno_copy = THRIFT_GET_SOCKET_ERROR;
     int32_t error = SSL_get_error(ssl_, bytes);
+    readretries_++;
+    if (bytes >= 0 && error == 0) {
+      readretries_ = 0;
+      break;
+    }
+    int32_t errno_copy = THRIFT_GET_SOCKET_ERROR;
     switch (error) {
       case SSL_ERROR_SYSCALL:
         if ((errno_copy != THRIFT_EINTR)
             && (errno_copy != THRIFT_EAGAIN)) {
               break;
         }
-        if (retries++ >= maxRecvRetries_) {
+        if (readretries_ >= maxRecvRetries_) {
           // THRIFT_EINTR needs to be handled manually and we can tolerate
           // a certain number
           break;
         }
       case SSL_ERROR_WANT_READ:
       case SSL_ERROR_WANT_WRITE:
-        if (waitForEvent(error == SSL_ERROR_WANT_READ) == TSSL_EINTR ) {
+        if (isLibeventSafe()) {
+          if (readretries_ < maxRecvRetries_) {
+            // THRIFT_EINTR needs to be handled manually and we can tolerate
+            // a certain number
+            return 0;
+          }
+          throw TTransportException(TTransportException::INTERNAL_ERROR, "too much recv retries");
+        }
+        else if (waitForEvent(error == SSL_ERROR_WANT_READ) == TSSL_EINTR ) {
           // repeat operation
-          if (retries++ < maxRecvRetries_) {
+          if (readretries_ < maxRecvRetries_) {
             // THRIFT_EINTR needs to be handled manually and we can tolerate
             // a certain number
             continue;
@@ -386,8 +438,22 @@ uint32_t TSSLSocket::read(uint8_t* buf, uint32_t len) {
   return bytes;
 }
 
-void TSSLSocket::write(const uint8_t* buf, uint32_t len) {
-  checkHandshake();
+/*
+ * Returns number of bytes written in SSL Socket.
+ * If eventSafe is set, and it may returns 0 bytes then write method
+ * needs to be called again until it is successfull or it throws
+ * exception incase of failure.
+*/
+uint32_t TSSLSocket::write(const uint8_t* buf, uint32_t len) {
+  initializeHandshake();
+  if (!checkHandshake())
+    return 0;
+  int shutdown = SSL_get_shutdown(ssl_);
+  // "!!" is squelching C4800 "forcing bool -> true or false" performance warning
+  bool shutdownReceived = !!(shutdown & SSL_RECEIVED_SHUTDOWN);
+  if (shutdownReceived) {
+    throw TTransportException(TTransportException::NOT_OPEN);
+  }
   // loop in case SSL_MODE_ENABLE_PARTIAL_WRITE is set in SSL_CTX.
   uint32_t written = 0;
   while (written < len) {
@@ -404,8 +470,14 @@ void TSSLSocket::write(const uint8_t* buf, uint32_t len) {
           }
         case SSL_ERROR_WANT_READ:
         case SSL_ERROR_WANT_WRITE:
+        if (isLibeventSafe()) {
+            return 0;
+        }
+        else {
+          // repeat operation
           waitForEvent(error == SSL_ERROR_WANT_READ);
           continue;
+        }
         default:;// do nothing
       }
       string errors;
@@ -414,6 +486,7 @@ void TSSLSocket::write(const uint8_t* buf, uint32_t len) {
     }
     written += bytes;
   }
+  return written;
 }
 
 void TSSLSocket::flush() {
@@ -421,7 +494,9 @@ void TSSLSocket::flush() {
   if (ssl_ == NULL) {
     return;
   }
-  checkHandshake();
+  initializeHandshake();
+  if (!checkHandshake())
+    throw TSSLException("BIO_flush: Handshake is not completed");
   BIO* bio = SSL_get_wbio(ssl_);
   if (bio == NULL) {
     throw TSSLException("SSL_get_wbio returns NULL");
@@ -434,14 +509,7 @@ void TSSLSocket::flush() {
   }
 }
 
-void TSSLSocket::checkHandshake() {
-  if (!TSocket::isOpen()) {
-    throw TTransportException(TTransportException::NOT_OPEN);
-  }
-  if (ssl_ != NULL) {
-    return;
-  }
-
+void TSSLSocket::initializeHandshakeParams() {
   // set underlying socket to non-blocking
   int flags;
   if ((flags = THRIFT_FCNTL(socket_, THRIFT_F_GETFL, 0)) < 0
@@ -451,10 +519,27 @@ void TSSLSocket::checkHandshake() {
     ::THRIFT_CLOSESOCKET(socket_);
     return;
   }
-
   ssl_ = ctx_->createSSL();
 
   SSL_set_fd(ssl_, static_cast<int>(socket_));
+}
+
+bool TSSLSocket::checkHandshake() {
+  return isHandshakeCompleted_;
+}
+
+void TSSLSocket::initializeHandshake() {
+  if (!TSocket::isOpen()) {
+    throw TTransportException(TTransportException::NOT_OPEN);
+  }
+  if (checkHandshake()) {
+    return;
+  }
+
+  if (ssl_ == NULL) {
+    initializeHandshakeParams();
+  }
+
   int rc;
   if (server()) {
     do {
@@ -470,8 +555,14 @@ void TSSLSocket::checkHandshake() {
             }
           case SSL_ERROR_WANT_READ:
           case SSL_ERROR_WANT_WRITE:
-            waitForEvent(error == SSL_ERROR_WANT_READ);
-            rc = 2;
+            if (isLibeventSafe()) {
+              return;
+            }
+            else {
+              // repeat operation
+              waitForEvent(error == SSL_ERROR_WANT_READ);
+              rc = 2;
+            }
           default:;// do nothing
         }
       }
@@ -495,8 +586,14 @@ void TSSLSocket::checkHandshake() {
             }
           case SSL_ERROR_WANT_READ:
           case SSL_ERROR_WANT_WRITE:
-            waitForEvent(error == SSL_ERROR_WANT_READ);
-                rc = 2;
+            if (isLibeventSafe()) {
+              return;
+            }
+            else {
+              // repeat operation
+              waitForEvent(error == SSL_ERROR_WANT_READ);
+              rc = 2;
+            }
           default:;// do nothing
         }
       }
@@ -510,6 +607,7 @@ void TSSLSocket::checkHandshake() {
     throw TSSLException(fname + ": " + errors);
   }
   authorize();
+  isHandshakeCompleted_ = true;
 }
 
 void TSSLSocket::authorize() {
@@ -618,6 +716,9 @@ void TSSLSocket::authorize() {
   }
 }
 
+/*
+ * Note: This method is not libevent safe.
+*/
 unsigned int TSSLSocket::waitForEvent(bool wantRead) {
   int fdSocket;
   BIO* bio;
@@ -801,12 +902,12 @@ void TSSLSocketFactory::loadPrivateKey(const char* path, const char* format) {
   }
 }
 
-void TSSLSocketFactory::loadTrustedCertificates(const char* path) {
+void TSSLSocketFactory::loadTrustedCertificates(const char* path, const char* capath) {
   if (path == NULL) {
     throw TTransportException(TTransportException::BAD_ARGS,
                               "loadTrustedCertificates: <path> is NULL");
   }
-  if (SSL_CTX_load_verify_locations(ctx_->get(), path, NULL) == 0) {
+  if (SSL_CTX_load_verify_locations(ctx_->get(), path, capath) == 0) {
     int errno_copy = THRIFT_GET_SOCKET_ERROR;
     string errors;
     buildErrors(errors, errno_copy);
@@ -859,7 +960,12 @@ void buildErrors(string& errors, int errno_copy) {
     }
   }
   if (errors.empty()) {
-    errors = "error code: " + to_string(errno_copy);
+    if (errno_copy == 0) {
+      errors += "Socket connection is closed";
+    }
+    else {
+      errors = "error code: " + to_string(errno_copy);
+    }
   }
 }
 

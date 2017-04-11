@@ -115,7 +115,7 @@ public:
   /**
    * Writes to the underlying socket.  Loops until done or fail.
    */
-  virtual void write(const uint8_t* buf, uint32_t len);
+  virtual uint32_t write(const uint8_t* buf, uint32_t len);
 
   /**
    * Writes to the underlying socket.  Does single send() and returns result.

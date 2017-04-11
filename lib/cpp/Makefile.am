@@ -114,6 +114,7 @@ libthrift_la_SOURCES += src/thrift/concurrency/Mutex.cpp \
 endif
 
 libthriftnb_la_SOURCES = src/thrift/server/TNonblockingServer.cpp \
+                         src/thrift/server/TNonblockingSSLServer.cpp \
                          src/thrift/async/TAsyncProtocolProcessor.cpp \
                          src/thrift/async/TEvhttpServer.cpp \
                          src/thrift/async/TEvhttpClientChannel.cpp
@@ -236,7 +237,8 @@ include_server_HEADERS = \
                          src/thrift/server/TSimpleServer.h \
                          src/thrift/server/TThreadPoolServer.h \
                          src/thrift/server/TThreadedServer.h \
-                         src/thrift/server/TNonblockingServer.h
+                         src/thrift/server/TNonblockingServer.h \
+                         src/thrift/server/TNonblockingSSLServer.h
 
 include_processordir = $(include_thriftdir)/processor
 include_processor_HEADERS = \

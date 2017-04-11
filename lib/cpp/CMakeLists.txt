@@ -138,6 +138,7 @@ endif()
 # Thrift non blocking server
 set( thriftcppnb_SOURCES
     src/thrift/server/TNonblockingServer.cpp
+    src/thrift/server/TNonblockingSSLServer.cpp
     src/thrift/async/TAsyncProtocolProcessor.cpp
     src/thrift/async/TEvhttpServer.cpp
     src/thrift/async/TEvhttpClientChannel.cpp

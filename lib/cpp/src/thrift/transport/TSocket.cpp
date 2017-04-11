@@ -612,7 +612,7 @@ try_again:
   return got;
 }
 
-void TSocket::write(const uint8_t* buf, uint32_t len) {
+uint32_t TSocket::write(const uint8_t* buf, uint32_t len) {
   uint32_t sent = 0;
 
   while (sent < len) {
@@ -624,6 +624,7 @@ void TSocket::write(const uint8_t* buf, uint32_t len) {
     }
     sent += b;
   }
+  return sent;
 }
 
 uint32_t TSocket::write_partial(const uint8_t* buf, uint32_t len) {
