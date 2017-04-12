@@ -17,8 +17,6 @@
  * under the License.
  */
 
-#define __STDC_FORMAT_MACROS
-
 #include <thrift/thrift-config.h>
 
 #include <thrift/server/TNonblockingSSLServer.h>
@@ -64,13 +62,12 @@
 #define AF_LOCAL AF_UNIX
 #endif
 
-#if !defined(PRIu32)
-#define PRIu32 "I32u"
-#define PRIu64 "I64u"
+#ifdef HAVE_INTTYPES_H
+#include <inttypes.h>
 #endif
 
-#if defined(_WIN32) && (_WIN32_WINNT < 0x0600)
-  #define AI_ADDRCONFIG 0x0400
+#ifdef HAVE_STDINT_H
+#include <stdint.h>
 #endif
 
 namespace apache {
@@ -228,8 +225,6 @@ public:
     inputTransport_.reset(new TMemoryBuffer(readBuffer_, readBufferSize_));
     outputTransport_.reset(
         new TMemoryBuffer(static_cast<uint32_t>(server_->getWriteBufferDefaultSize())));
-    // for a new TConnection, create a new SSLSocket object
-    T_DEBUG("New TConnection with socket fd %d\n", socket);
     tSocket_.reset();
     tSocket_ = server_->getTSSLSocketFactory()->createSocket();
     tSocket_->setLibeventSafe();
@@ -296,6 +291,7 @@ public:
   void forceClose() {
     appState_ = APP_CLOSE_CONNECTION;
     if (!notifyIOThread()) {
+      server_->decrementActiveProcessors();
       close();
       throw TException("TConnection::forceClose: failed write on notify pipe");
     }
@@ -357,6 +353,7 @@ public:
     // Signal completion back to the libevent thread via a pipe
     if (!connection_->notifyIOThread()) {
       GlobalOutput.printf("TNonblockingSSLServer: failed to notifyIOThread, closing.");
+      connection_->server_->decrementActiveProcessors();
       connection_->close();
       throw TException("TNonblockingSSLServer::Task::run: failed write on notify pipe");
     }
@@ -373,11 +370,10 @@ private:
   void* connectionContext_;
 };
 
-void TNonblockingSSLServer::TConnection::init(THRIFT_SOCKET socket, /* socket descriptor, int */
+void TNonblockingSSLServer::TConnection::init(THRIFT_SOCKET socket,
                                            TNonblockingSSLIOThread* ioThread,
                                            const sockaddr* addr,
                                            socklen_t addrLen) {
-  T_DEBUG("TConnection::init() with socket fd %d, current tSocket_ fd is %d\n", socket, tSocket_->getSocketFD());
   tSocket_->setSocketFD(socket);
   tSocket_->setCachedAddress(addr, addrLen);
 
@@ -423,7 +419,6 @@ void TNonblockingSSLServer::TConnection::workSocket() {
 
   switch (socketState_) {
   case SOCKET_RECV_FRAMING:
-  T_DEBUG("TConnection::workSocket(), SOCKET_RECV_FRAMING%s","\n");
     union {
       uint8_t buf[sizeof(uint32_t)];
       uint32_t size;
@@ -470,12 +465,10 @@ void TNonblockingSSLServer::TConnection::workSocket() {
       return;
     }
     // size known; now get the rest of the frame
-    T_DEBUG("TConnection::workSocket() readWant_ = %d\n", readWant_);
     transition();
     return;
 
   case SOCKET_RECV:
-    T_DEBUG("Entering SOCKET_RECV state%s","\n");
     // It is an error to be in this state if we already have all the data
     assert(readBufferPos_ < readWant_);
 
@@ -524,7 +517,6 @@ void TNonblockingSSLServer::TConnection::workSocket() {
 
     try {
       left = writeBufferSize_ - writeBufferPos_;
-      //replacing write_partial with write and deducting  
       uint32_t writeBytes = tSocket_->write(writeBuffer_ + writeBufferPos_, left);
       if (writeBytes == 0)
         return;
@@ -573,7 +565,6 @@ void TNonblockingSSLServer::TConnection::transition() {
   switch (appState_) {
 
   case APP_READ_REQUEST:
-    T_DEBUG("TConnection::transition(), APP_READ_REQUEST%s","\n");
     // We are done reading the request, package the read buffer into transport
     // and get back some data from the dispatch function
     if (server_->getHeaderTransport()) {
@@ -602,21 +593,24 @@ void TNonblockingSSLServer::TConnection::transition() {
       // The application is now waiting on the task to finish
       appState_ = APP_WAIT_TASK;
 
+      // Set this connection idle so that libevent doesn't process more
+      // data on it while we're still waiting for the threadmanager to
+      // finish this task
+      setIdle();
+
       try {
         server_->addTask(task);
       } catch (IllegalStateException& ise) {
         // The ThreadManager is not ready to handle any more tasks (it's probably shutting down).
         GlobalOutput.printf("IllegalStateException: Server::process() %s", ise.what());
+        server_->decrementActiveProcessors();
         close();
       } catch (TimedOutException& to) {
         GlobalOutput.printf("[ERROR] TimedOutException: Server::process() %s", to.what());
+        server_->decrementActiveProcessors();
         close();
       }
 
-      // Set this connection idle so that libevent doesn't process more
-      // data on it while we're still waiting for the threadmanager to
-      // finish this task
-      setIdle();
       return;
     } else {
       try {
@@ -656,7 +650,6 @@ void TNonblockingSSLServer::TConnection::transition() {
     // into the outputTransport_, so we grab its contents and place them into
     // the writeBuffer_ for actual writing by the libevent thread
   
-    T_DEBUG("TConnection::transition(), APP_WAIT_TASK%s","\n");
     server_->decrementActiveProcessors();
     // Get the result of the operation
     outputTransport_->getBuffer(&writeBuffer_, &writeBufferSize_);
@@ -689,8 +682,6 @@ void TNonblockingSSLServer::TConnection::transition() {
     goto LABEL_APP_INIT;
 
   case APP_SEND_RESULT:
-
-    T_DEBUG("TConnection::transition(), APP_SEND_RESULT%s","\n");
     // it's now safe to perform buffer size housekeeping.
     if (writeBufferSize_ > largestWriteBufferSize_) {
       largestWriteBufferSize_ = writeBufferSize_;
@@ -718,7 +709,6 @@ void TNonblockingSSLServer::TConnection::transition() {
 
     readBufferPos_ = 0;
 
-    T_DEBUG("TConnection::Transition(), socket fd: %d\n", tSocket_->getSocketFD());
     // Register read event
     setRead();
 
@@ -730,7 +720,6 @@ void TNonblockingSSLServer::TConnection::transition() {
   case APP_READ_FRAME_SIZE:
     readWant_ += 4;
 
-    T_DEBUG("TConnection::transition(), APP_READ_FRAME_SIZE%s","\n");
     // We just read the request length
     // Double the buffer size until it is big enough
     if (readWant_ > readBufferSize_) {
@@ -764,8 +753,6 @@ void TNonblockingSSLServer::TConnection::transition() {
     return;
 
   case APP_CLOSE_CONNECTION:
-
-    T_DEBUG("TConnection::transition(), APP_CLOSE_CONNECTION%s","\n");
     server_->decrementActiveProcessors();
     close();
     return;
@@ -783,11 +770,9 @@ void TNonblockingSSLServer::TConnection::setFlags(short eventFlags) {
   }
 
   // Delete a previously existing event
-  if (eventFlags_ != 0) {
-    if (event_del(&event_) == -1) {
-      GlobalOutput("TConnection::setFlags event_del");
-      return;
-    }
+  if (eventFlags_ && event_del(&event_) == -1) {
+    GlobalOutput.perror("TConnection::setFlags() event_del", THRIFT_GET_SOCKET_ERROR);
+    return;
   }
 
   // Update in memory structure
@@ -825,13 +810,12 @@ void TNonblockingSSLServer::TConnection::setFlags(short eventFlags) {
    * ev structure for multiple monitored descriptors; each descriptor needs
    * its own ev.
    */
-  T_DEBUG("Socket fd: %d\n", tSocket_->getSocketFD());
   event_set(&event_, tSocket_->getSocketFD(), eventFlags_, TConnection::eventHandler, this);
   event_base_set(ioThread_->getEventBase(), &event_);
 
   // Add the event
   if (event_add(&event_, 0) == -1) {
-    GlobalOutput("TConnection::setFlags(): could not event_add");
+    GlobalOutput.perror("TConnection::setFlags(): could not event_add", THRIFT_GET_SOCKET_ERROR);
   }
 }
 
@@ -839,10 +823,7 @@ void TNonblockingSSLServer::TConnection::setFlags(short eventFlags) {
  * Closes a connection
  */
 void TNonblockingSSLServer::TConnection::close() {
-  // Delete the registered libevent
-  if (event_del(&event_) == -1) {
-    GlobalOutput.perror("TConnection::close() event_del", THRIFT_GET_SOCKET_ERROR);
-  }
+  setIdle();
 
   if (serverEventHandler_) {
     serverEventHandler_->deleteContext(connectionContext_, inputProtocol_, outputProtocol_);
@@ -914,7 +895,7 @@ TNonblockingSSLServer::TConnection* TNonblockingSSLServer::createConnection(THRI
   nextIOThread_ = static_cast<uint32_t>((nextIOThread_ + 1) % ioThreads_.size());
 
   TNonblockingSSLIOThread* ioThread = ioThreads_[selectedThreadIdx].get();
-  T_DEBUG("Num of IO threads is %d\n", ioThreads_.size());
+
   // Check the connection stack to see if we can re-use
   TConnection* result = NULL;
   if (connectionStack_.empty()) {
@@ -958,8 +939,6 @@ void TNonblockingSSLServer::handleEvent(THRIFT_SOCKET fd, short which) {
   // Make sure that libevent didn't mess up the socket handles
   assert(fd == serverSocket_);
 
-  T_DEBUG("TNonblockingSSLServer::handleEvent, listen on %d\n", serverSocket_);
-
   // Server socket accepted a new connection
   socklen_t addrLen;
   sockaddr_storage addrStorage;
@@ -1001,7 +980,6 @@ void TNonblockingSSLServer::handleEvent(THRIFT_SOCKET fd, short which) {
     }
 
     // Create a new TConnection for this client socket.
-    T_DEBUG("TNonblockingSSLServer::handleEvent() , Creating new client connection fd:%d\n", clientSocket); 
     TConnection* clientConnection = createConnection(clientSocket, addrp, addrLen);
 
     // Fail fast if we could not create a TConnection object
@@ -1028,7 +1006,7 @@ void TNonblockingSSLServer::handleEvent(THRIFT_SOCKET fd, short which) {
     } else {
       if (!clientConnection->notifyIOThread()) {
         GlobalOutput.perror("[ERROR] notifyIOThread failed on fresh connection, closing", errno);
-        returnConnection(clientConnection);
+        clientConnection->close();
       }
     }
 
@@ -1088,7 +1066,7 @@ void TNonblockingSSLServer::createAndListenOnSocket() {
   if (res->ai_family == AF_INET6) {
     int zero = 0;
     if (-1 == setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, const_cast_sockopt(&zero), sizeof(zero))) {
-      GlobalOutput("TServerSocket::listen() IPV6_V6ONLY");
+      GlobalOutput.perror("TServerSocket::listen() IPV6_V6ONLY", THRIFT_GET_SOCKET_ERROR);
     }
   }
 #endif // #ifdef IPV6_V6ONLY
@@ -1343,7 +1321,7 @@ TNonblockingSSLIOThread::~TNonblockingSSLIOThread() {
     ownEventBase_ = false;
   }
 
-  if (listenSocket_ >= 0) {
+  if (listenSocket_ != THRIFT_INVALID_SOCKET) {
     if (0 != ::THRIFT_CLOSESOCKET(listenSocket_)) {
       GlobalOutput.perror("TNonblockingSSLIOThread listenSocket_ close(): ", THRIFT_GET_SOCKET_ERROR);
     }
@@ -1409,7 +1387,7 @@ void TNonblockingSSLIOThread::registerEvents() {
                         event_base_get_method(eventBase_));
   }
 
-  if (listenSocket_ >= 0) {
+  if (listenSocket_ != THRIFT_INVALID_SOCKET) {
     // Register the server event
     event_set(&serverEvent_,
               listenSocket_,
@@ -1419,7 +1397,7 @@ void TNonblockingSSLIOThread::registerEvents() {
     event_base_set(eventBase_, &serverEvent_);
 
     // Add the event and start up the server
-    if (-1 == event_add(&serverEvent_, 0)) { // event_add will mark the event as pending. 
+    if (-1 == event_add(&serverEvent_, 0)) {
       throw TException(
           "TNonblockingSSLServer::serve(): "
           "event_add() failed on server listen event");
@@ -1508,6 +1486,7 @@ void TNonblockingSSLIOThread::notifyHandler(evutil_socket_t fd, short which, voi
     if (nBytes == kSize) {
       if (connection == NULL) {
         // this is the command to stop our thread, exit the handler!
+        ioThread->breakLoop(false);
         return;
       }
       connection->transition();
@@ -1518,6 +1497,7 @@ void TNonblockingSSLIOThread::notifyHandler(evutil_socket_t fd, short which, voi
       return;
     } else if (nBytes == 0) {
       GlobalOutput.printf("notifyHandler: Notify socket closed!");
+      ioThread->breakLoop(false);
       // exit the loop
       break;
     } else { // nBytes < 0
@@ -1542,19 +1522,15 @@ void TNonblockingSSLIOThread::breakLoop(bool error) {
     ::abort();
   }
 
-  // sets a flag so that the loop exits on the next event
-  event_base_loopbreak(eventBase_);
-
-  // event_base_loopbreak() only causes the loop to exit the next time
-  // it wakes up.  We need to force it to wake up, in case there are
-  // no real events it needs to process.
-  //
   // If we're running in the same thread, we can't use the notify(0)
   // mechanism to stop the thread, but happily if we're running in the
   // same thread, this means the thread can't be blocking in the event
   // loop either.
   if (!Thread::is_current(threadId_)) {
     notify(NULL);
+  } else {
+    // cause the loop to stop ASAP - even if it has things to do in it
+    event_base_loopbreak(eventBase_);
   }
 }
 
@@ -1588,31 +1564,33 @@ void TNonblockingSSLIOThread::setCurrentThreadHighPriority(bool value) {
 }
 
 void TNonblockingSSLIOThread::run() {
-  if (eventBase_ == NULL)
+  if (eventBase_ == NULL) {
     registerEvents();
-
-  GlobalOutput.printf("TNonblockingSSLServer: IO thread #%d entering loop...", number_);
-
+  }
   if (useHighPriority_) {
     setCurrentThreadHighPriority(true);
   }
 
-  // Run libevent engine, never returns, invokes calls to eventHandler
-  event_base_loop(eventBase_, 0);
+  if (eventBase_ != NULL)
+  {
+    GlobalOutput.printf("TNonblockingSSLServer: IO thread #%d entering loop...", number_);
+    // Run libevent engine, never returns, invokes calls to eventHandler
+    event_base_loop(eventBase_, 0);
 
-  if (useHighPriority_) {
-    setCurrentThreadHighPriority(false);
+    if (useHighPriority_) {
+      setCurrentThreadHighPriority(false);
+    }
+
+    // cleans up our registered events
+    cleanupEvents();
   }
-
-  // cleans up our registered events
-  cleanupEvents();
 
   GlobalOutput.printf("TNonblockingSSLServer: IO thread #%d run() done!", number_);
 }
 
 void TNonblockingSSLIOThread::cleanupEvents() {
   // stop the listen socket, if any
-  if (listenSocket_ >= 0) {
+  if (listenSocket_ != THRIFT_INVALID_SOCKET) {
     if (event_del(&serverEvent_) == -1) {
       GlobalOutput.perror("TNonblockingSSLIOThread::stop() event_del: ", THRIFT_GET_SOCKET_ERROR);
     }
