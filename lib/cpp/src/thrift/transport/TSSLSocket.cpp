@@ -381,12 +381,6 @@ uint32_t TSSLSocket::read(uint8_t* buf, uint32_t len) {
   initializeHandshake();
   if (!checkHandshake())
     return 0;
-  int shutdown = SSL_get_shutdown(ssl_);
-  // "!!" is squelching C4800 "forcing bool -> true or false" performance warning
-  bool shutdownReceived = !!(shutdown & SSL_RECEIVED_SHUTDOWN);
-  if (shutdownReceived) {
-    throw TTransportException(TTransportException::NOT_OPEN);
-  }
   int32_t bytes = 0;
   while (readretries_ < maxRecvRetries_) {
     ERR_clear_error();
@@ -448,12 +442,6 @@ uint32_t TSSLSocket::write(const uint8_t* buf, uint32_t len) {
   initializeHandshake();
   if (!checkHandshake())
     return 0;
-  int shutdown = SSL_get_shutdown(ssl_);
-  // "!!" is squelching C4800 "forcing bool -> true or false" performance warning
-  bool shutdownReceived = !!(shutdown & SSL_RECEIVED_SHUTDOWN);
-  if (shutdownReceived) {
-    throw TTransportException(TTransportException::NOT_OPEN);
-  }
   // loop in case SSL_MODE_ENABLE_PARTIAL_WRITE is set in SSL_CTX.
   uint32_t written = 0;
   while (written < len) {
@@ -960,12 +948,7 @@ void buildErrors(string& errors, int errno_copy) {
     }
   }
   if (errors.empty()) {
-    if (errno_copy == 0) {
-      errors += "Socket connection is closed";
-    }
-    else {
-      errors = "error code: " + to_string(errno_copy);
-    }
+    errors = "error code: " + to_string(errno_copy);
   }
 }
 
