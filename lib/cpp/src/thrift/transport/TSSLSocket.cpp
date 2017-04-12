@@ -462,7 +462,6 @@ uint32_t TSSLSocket::write(const uint8_t* buf, uint32_t len) {
             return 0;
         }
         else {
-          // repeat operation
           waitForEvent(error == SSL_ERROR_WANT_READ);
           continue;
         }
