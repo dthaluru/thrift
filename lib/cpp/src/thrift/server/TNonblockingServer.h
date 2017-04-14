@@ -25,6 +25,7 @@
 #include <thrift/transport/PlatformSocket.h>
 #include <thrift/transport/TBufferTransports.h>
 #include <thrift/transport/TSocket.h>
+#include <thrift/transport/TSSLSocket.h>
 #include <thrift/concurrency/ThreadManager.h>
 #include <climits>
 #include <thrift/concurrency/Thread.h>
@@ -47,6 +48,8 @@ namespace server {
 
 using apache::thrift::transport::TMemoryBuffer;
 using apache::thrift::transport::TSocket;
+using apache::thrift::transport::TSSLSocket;
+using apache::thrift::transport::TSSLSocketFactory;
 using apache::thrift::protocol::TProtocol;
 using apache::thrift::concurrency::Runnable;
 using apache::thrift::concurrency::ThreadManager;
@@ -162,6 +165,12 @@ private:
 
   /// Port server actually runs on
   int listenPort_;
+
+  /// SSL Socket Factory
+  boost::shared_ptr<TSSLSocketFactory> factory_;
+
+  /// Is SSL enabled?
+  bool sslEnabled_;
 
   /// The optional user-provided event-base (for single-thread servers)
   event_base* userEventBase_;
@@ -304,6 +313,8 @@ private:
     overloaded_ = false;
     nConnectionsDropped_ = 0;
     nTotalConnectionsDropped_ = 0;
+    sslEnabled_ = false;
+    factory_ = NULL;
   }
 
 public:
@@ -312,9 +323,25 @@ public:
     init(port);
   }
 
+  TNonblockingServer(const boost::shared_ptr<TProcessorFactory>& processorFactory,
+                     int port,
+                     const boost::shared_ptr<TSSLSocketFactory>& sslSocketFactory)
+    : TServer(processorFactory) {
+    init(port);
+    setSSLSocketFactory(sslSocketFactory);
+  }
+
   TNonblockingServer(const boost::shared_ptr<TProcessor>& processor, int port)
     : TServer(processor) {
     init(port);
+  }
+
+  TNonblockingServer(const boost::shared_ptr<TProcessor>& processor,
+                     int port,
+                     const boost::shared_ptr<TSSLSocketFactory>& sslSocketFactory)
+    : TServer(processor) {
+    init(port);
+    setSSLSocketFactory(sslSocketFactory);
   }
 
   TNonblockingServer(const boost::shared_ptr<TProcessorFactory>& processorFactory,
@@ -331,6 +358,22 @@ public:
     setThreadManager(threadManager);
   }
 
+  TNonblockingServer(const boost::shared_ptr<TProcessorFactory>& processorFactory,
+                     const boost::shared_ptr<TProtocolFactory>& protocolFactory,
+                     int port,
+                     const boost::shared_ptr<TSSLSocketFactory>& sslSocketFactory,
+                     const boost::shared_ptr<ThreadManager>& threadManager
+                     = boost::shared_ptr<ThreadManager>())
+    : TServer(processorFactory) {
+
+    init(port);
+    setSSLSocketFactory(sslSocketFactory);
+
+    setInputProtocolFactory(protocolFactory);
+    setOutputProtocolFactory(protocolFactory);
+    setThreadManager(threadManager);
+  }
+
   TNonblockingServer(const boost::shared_ptr<TProcessor>& processor,
                      const boost::shared_ptr<TProtocolFactory>& protocolFactory,
                      int port,
@@ -339,6 +382,23 @@ public:
     : TServer(processor) {
 
     init(port);
+
+    setInputProtocolFactory(protocolFactory);
+    setOutputProtocolFactory(protocolFactory);
+    setThreadManager(threadManager);
+  }
+
+  TNonblockingServer(const boost::shared_ptr<TProcessor>& processor,
+                     const boost::shared_ptr<TProtocolFactory>& protocolFactory,
+                     int port,
+                     const boost::shared_ptr<TSSLSocketFactory>& sslSocketFactory,
+                     const boost::shared_ptr<ThreadManager>& threadManager
+                     = boost::shared_ptr<ThreadManager>()
+				)
+    : TServer(processor) {
+
+    init(port);
+    setSSLSocketFactory(sslSocketFactory);
 
     setInputProtocolFactory(protocolFactory);
     setOutputProtocolFactory(protocolFactory);
@@ -364,6 +424,27 @@ public:
     setThreadManager(threadManager);
   }
 
+  TNonblockingServer(const boost::shared_ptr<TProcessorFactory>& processorFactory,
+                     const boost::shared_ptr<TTransportFactory>& inputTransportFactory,
+                     const boost::shared_ptr<TTransportFactory>& outputTransportFactory,
+                     const boost::shared_ptr<TProtocolFactory>& inputProtocolFactory,
+                     const boost::shared_ptr<TProtocolFactory>& outputProtocolFactory,
+                     int port,
+                     const boost::shared_ptr<TSSLSocketFactory>& sslSocketFactory,
+                     const boost::shared_ptr<ThreadManager>& threadManager
+                     = boost::shared_ptr<ThreadManager>())
+    : TServer(processorFactory) {
+
+    init(port);
+    setSSLSocketFactory(sslSocketFactory);
+
+    setInputTransportFactory(inputTransportFactory);
+    setOutputTransportFactory(outputTransportFactory);
+    setInputProtocolFactory(inputProtocolFactory);
+    setOutputProtocolFactory(outputProtocolFactory);
+    setThreadManager(threadManager);
+  }
+
   TNonblockingServer(const boost::shared_ptr<TProcessor>& processor,
                      const boost::shared_ptr<TTransportFactory>& inputTransportFactory,
                      const boost::shared_ptr<TTransportFactory>& outputTransportFactory,
@@ -375,6 +456,27 @@ public:
     : TServer(processor) {
 
     init(port);
+
+    setInputTransportFactory(inputTransportFactory);
+    setOutputTransportFactory(outputTransportFactory);
+    setInputProtocolFactory(inputProtocolFactory);
+    setOutputProtocolFactory(outputProtocolFactory);
+    setThreadManager(threadManager);
+  }
+
+  TNonblockingServer(const boost::shared_ptr<TProcessor>& processor,
+                     const boost::shared_ptr<TTransportFactory>& inputTransportFactory,
+                     const boost::shared_ptr<TTransportFactory>& outputTransportFactory,
+                     const boost::shared_ptr<TProtocolFactory>& inputProtocolFactory,
+                     const boost::shared_ptr<TProtocolFactory>& outputProtocolFactory,
+                     int port,
+                     const boost::shared_ptr<TSSLSocketFactory>& sslSocketFactory,
+                     const boost::shared_ptr<ThreadManager>& threadManager
+                     = boost::shared_ptr<ThreadManager>())
+    : TServer(processor) {
+
+    init(port);
+    setSSLSocketFactory(sslSocketFactory);
 
     setInputTransportFactory(inputTransportFactory);
     setOutputTransportFactory(outputTransportFactory);
@@ -384,6 +486,11 @@ public:
   }
 
   ~TNonblockingServer();
+
+  void setSSLSocketFactory(boost::shared_ptr<TSSLSocketFactory> factory) { factory_ = factory; sslEnabled_ = true; }
+
+  /* Return the handle to the SSLSocket Factory instance, which is used to create SSL sockets */
+  boost::shared_ptr<TSSLSocketFactory> getTSSLSocketFactory() { return factory_; }
 
   void setThreadManager(boost::shared_ptr<ThreadManager> threadManager);
 

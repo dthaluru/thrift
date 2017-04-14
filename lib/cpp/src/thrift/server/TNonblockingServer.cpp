@@ -224,7 +224,18 @@ public:
     inputTransport_.reset(new TMemoryBuffer(readBuffer_, readBufferSize_));
     outputTransport_.reset(
         new TMemoryBuffer(static_cast<uint32_t>(server_->getWriteBufferDefaultSize())));
-    tSocket_.reset(new TSocket());
+
+    if (server_->sslEnabled_) {
+      boost::shared_ptr<TSSLSocket> tSSLSocket_;
+      tSSLSocket_.reset();
+      tSSLSocket_ = server_->getTSSLSocketFactory()->createSocket();
+      tSSLSocket_->setLibeventSafe();
+      tSocket_ = tSSLSocket_;
+    }
+    else {
+      tSocket_.reset(new TSocket());
+    }
+
     init(socket, ioThread, addr, addrLen);
   }
 
@@ -435,9 +446,15 @@ void TNonblockingServer::TConnection::workSocket() {
       fetch = tSocket_->read(&framing.buf[readBufferPos_],
                              uint32_t(sizeof(framing.size) - readBufferPos_));
       if (fetch == 0) {
-        // Whenever we get here it means a remote disconnect
-        close();
-        return;
+          if (server_->sslEnabled_) {
+            // Call read method again
+            return;
+          }
+          else {
+            // Whenever we get here it means a remote disconnect
+            close();
+            return;
+          }
       }
       readBufferPos_ += fetch;
     } catch (TTransportException& te) {
@@ -501,8 +518,10 @@ void TNonblockingServer::TConnection::workSocket() {
       return;
     }
 
-    // Whenever we get down here it means a remote disconnect
-    close();
+    if (!server_->sslEnabled_) {
+      //If SSL is not enabled and whenever we get down here it means a remote disconnect
+      close();
+    }
 
     return;
 
@@ -748,7 +767,9 @@ void TNonblockingServer::TConnection::transition() {
     appState_ = APP_READ_REQUEST;
 
     // Work the socket right away
-    // workSocket();
+    if (server_->sslEnabled_) {
+      workSocket();
+    }
 
     return;
 
