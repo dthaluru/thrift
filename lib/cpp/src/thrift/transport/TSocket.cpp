@@ -608,6 +608,10 @@ try_again:
     // Some other error, whatevz
     throw TTransportException(TTransportException::UNKNOWN, "Unknown", errno_copy);
   }
+  
+  if (got == 0) {
+    throw TTransportException(TTransportException::NOT_OPEN, "Called read on non-open socket");
+  }
 
   return got;
 }
