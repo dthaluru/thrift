@@ -40,6 +40,7 @@ protected:
     return valid_ ? boost::shared_ptr<TestTTransport>(new TestTTransport)
                   : boost::shared_ptr<TestTTransport>();
   }
+  THRIFT_SOCKET getSocketFD() { return -1; }
 };
 
 BOOST_AUTO_TEST_CASE(test_positive_accept) {

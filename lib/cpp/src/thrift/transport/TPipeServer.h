@@ -83,6 +83,7 @@ public:
 
 protected:
   virtual boost::shared_ptr<TTransport> acceptImpl();
+  THRIFT_SOCKET getSocketFD() { return -1; }
 
 private:
   boost::shared_ptr<TPipeServerImpl> impl_;
